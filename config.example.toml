@@ -1,0 +1,6 @@
+# CLI equivalents; this example is documentation, not automatically loaded.
+model = "qwen3-asr-1.7b"
+language = "Cantonese"
+chunk_seconds = 28
+timestamps = true
+keep_runtime = false

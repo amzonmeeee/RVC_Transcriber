@@ -1,0 +1,6 @@
+mlx-qwen3-asr==0.4.4
+imageio-ffmpeg==0.6.0
+opencc-python-reimplemented==0.1.7
+huggingface-hub==0.36.0
+faster-whisper==1.2.1
+tokenizers==0.22.2
