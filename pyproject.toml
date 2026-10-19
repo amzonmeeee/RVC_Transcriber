@@ -1,0 +1,8 @@
+[project]
+name = "rvc-lecture-transcriber"
+version = "0.1.0"
+description = "Offline Cantonese-English MP4 transcription with a disposable local runtime"
+requires-python = ">=3.9"
+
+[tool.ruff]
+line-length = 110
