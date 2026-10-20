@@ -7,6 +7,11 @@ Turn MP4 lectures into one UTF-8 text file per recording, locally. Designed for 
 Supported release: **Apple Silicon macOS 14+**, an existing Python 3.9+ for the small standard-library supervisor, and built-in `curl`. The supervisor installs no packages into that Python. Inference uses a private Python 3.12.12. This checkout does not install Command Line Tools, Homebrew, drivers, or anything globally. Windows, Linux and Intel Macs currently fail with an explicit unsupported-platform error; `run.ps1` is an explanatory stub, not Windows support.
 
 ```sh
+git clone https://github.com/amzonmeeee/RVC_Transcriber.git
+cd RVC_Transcriber
+```
+
+```sh
 ./run.sh doctor
 ./run.sh preview --input "$HOME/LecturesMP4" --output "../PreviewTranscripts" --timestamps --keep-runtime --yes
 ./run.sh transcribe --input "$HOME/LecturesMP4" --output "../Transcripts" --timestamps --yes
@@ -21,6 +26,7 @@ Multiple input folders are accepted in one invocation:
 ```
 
 Same-named recordings are compared by complete SHA-256. Identical copies share one transcript; distinct same-named recordings are refused. Unicode and spaces are supported. Recursive discovery is opt-in with `--recursive`.
+
 
 ## Controls
 
@@ -82,4 +88,4 @@ git config core.hooksPath scripts
 
 Stdlib tests run without downloading weights. Media tests use actual project-managed FFmpeg and generated MP4 test tones with an explicitly mocked recognizer: they test media, resumability, atomic text publication and deletion, not ASR accuracy. All temporary test fixtures stay in the disposable runtime. CI runs source/safety checks, not multi-GB model inference.
 
-The privacy guard rejects staged/tracked media, model weights, environments, logs, transcripts, likely secrets and files above 1 MiB. Review `git diff --cached --stat` before publishing. No remote is created and no push is performed automatically.
+The privacy guard rejects staged/tracked media, model weights, environments, logs, transcripts, likely secrets and files above 1 MiB. `.gitignore` additionally excludes generated text, model/cache folders, binary downloads and local credentials. Review `git diff --cached --stat` before publishing. Transcription commands never create a remote or push automatically; publication is an explicit Git operation.
