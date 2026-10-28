@@ -1,6 +1,6 @@
 # Local lecture transcriber
 
-Turn MP4 lectures into one UTF-8 text file per recording, locally. Designed for Hong Kong Cantonese with English academic terms. Audio and text are never sent to an inference service. No API key or subscription is required.
+Turn MP4 lectures, or HKUST Canvas RVC recordings, into one UTF-8 text file per recording, locally. Designed for Hong Kong Cantonese with English academic terms. Audio and text are never sent to an inference service. No API key or subscription is required.
 
 ## Quick start
 
@@ -27,6 +27,28 @@ Multiple input folders are accepted in one invocation:
 
 Same-named recordings are compared by complete SHA-256. Identical copies share one transcript; distinct same-named recordings are refused. Unicode and spaces are supported. Recursive discovery is opt-in with `--recursive`.
 
+## HKUST Canvas / RVC recordings
+
+Paste a Canvas link instead of downloading videos yourself. The program finds the course's RVC (Remote Video Capture) lecture recordings, streams only their audio with the project FFmpeg, and transcribes them. No video file is saved; the temporary WAV stays in the disposable runtime.
+
+```sh
+./run.sh hkust "https://canvas.ust.hk/courses/<id>" --list                    # what was found
+./run.sh hkust "https://canvas.ust.hk/courses/<id>" --output "../Transcripts" --timestamps --yes
+./run.sh hkust "<link>" --select 2026-09 --latest 2 --output "../Transcripts"   # filter by title/date
+./run.sh hkust "<link>" --preview --output "../PreviewTranscripts" --keep-runtime --yes
+```
+
+Accepted links: a course home, `/modules`, a module, a module item, a page that lists the recordings, a single recording page, or an `rvcmedia.ust.hk` player link. All transcription options (`--model`, `--glossary`, `--resume`, `--overwrite`, `--keep-runtime`, `--dry-run` ...) work as for `transcribe`. Recordings that already have a transcript in the output folder are skipped.
+
+Requirements: Google Chrome signed in to HKUST Canvas, with **View > Developer > Allow JavaScript from Apple Events** enabled. macOS asks once to allow Terminal to control Chrome. The program opens its own Chrome tabs, makes same-origin requests with your existing sign-in, and closes those tabs; it stores no password, cookie or token.
+
+How recordings are found (as observed in 2026; fictional example names):
+
+1. Each lecture is a Canvas page titled like `COMP1000-L1-2026-09-01-09-00` (course-section-date-time). Module pages usually link to them.
+2. That page embeds `https://rvcmedia.ust.hk/media/?path=<media id>`.
+3. With HKUST sign-in, `https://rvcmedia.ust.hk/Media/Play?path=<media id>` contains the HLS playlist (`.m3u8`) with a time-limited token. FFmpeg reads that playlist directly.
+
+Stream links are fetched again on every run, so rerunning with `--resume` after an interruption works after a token has expired. Courses that publish Zoom cloud recordings instead of RVC are not supported. Recordings remain subject to HKUST copyright policy; keep transcripts for your own study.
 
 ## Controls
 

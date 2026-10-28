@@ -27,7 +27,10 @@ def inference_offline():
     constants.HF_HUB_OFFLINE = True
 
 
-def fingerprint(path):
+def fingerprint(path, stream_id=None):
+    if stream_id:
+        # Streams are identified by their stable RVC media path; the URL token changes per run.
+        return dict(stream=stream_id)
     s = path.stat()
     # Full hash is deliberate: same-name/copy recordings and changed inputs are verified.
     return dict(size=s.st_size, mtime_ns=s.st_mtime_ns, sha256=sha256(path))
@@ -40,16 +43,31 @@ def checkpoint_key(item, job):
     return hashlib.sha256(json.dumps(cfg, sort_keys=True).encode()).hexdigest(), cfg
 
 
-def extract(ffmpeg, source, audio, job):
-    args = [ffmpeg, '-nostdin', '-hide_banner', '-loglevel', 'error', '-y', '-i', str(source)]
-    if job['preview']:
-        args += ['-ss', str(job['start']), '-t', str(job['seconds'])]
+# Network options for HLS streams (HKUST RVC); local files never touch the network.
+STREAM_OPTIONS = ['-reconnect', '1', '-reconnect_on_network_error', '1', '-reconnect_delay_max', '30',
+                  '-rw_timeout', '60000000']
+
+
+def extract(ffmpeg, source, audio, job, stream=None):
+    args = [ffmpeg, '-nostdin', '-hide_banner', '-loglevel', 'error', '-y']
+    if stream:
+        # Input seeking: a preview fetches only the requested part of the stream.
+        if job['preview']:
+            args += ['-ss', str(job['start'])]
+        args += [*STREAM_OPTIONS, '-i', stream]
+        if job['preview']:
+            args += ['-t', str(job['seconds'])]
+    else:
+        args += ['-i', str(source)]
+        if job['preview']:
+            args += ['-ss', str(job['start']), '-t', str(job['seconds'])]
     args += ['-map', '0:a:0', '-vn', '-ac', '1', '-ar', str(SAMPLE_RATE), '-c:a', 'pcm_s16le', str(audio)]
     partial = audio.with_suffix('.partial.wav')
     args[-1] = str(partial)
     result = subprocess.run(args, capture_output=True, text=True)
     if result.returncode:
-        raise RuntimeError('Audio extraction failed (missing audio stream or corrupt MP4): ' + result.stderr[-3000:])
+        raise RuntimeError('Audio extraction failed (missing audio stream, corrupt MP4, or expired/unreachable '
+                           'stream; rerun to fetch a fresh stream link): ' + result.stderr[-3000:])
     with wave.open(str(partial), 'rb') as wav:
         if wav.getnframes() == 0:
             raise ValueError('No audio in selected interval')
@@ -258,7 +276,8 @@ def process_file(item, job, ffmpeg, backend_factory, converter, progress):
     source, output = Path(item['source']), Path(item['output'])
     key, cfg = checkpoint_key(item, job)
     checkpoint = root / 'checkpoints' / (key + '.json')
-    identity = fingerprint(source)
+    stream, stream_id = item.get('stream'), item.get('stream_id')
+    identity = fingerprint(source, stream_id)
     state = None
     if checkpoint.exists() and job['resume']:
         state = json.loads(checkpoint.read_text())
@@ -282,7 +301,7 @@ def process_file(item, job, ffmpeg, backend_factory, converter, progress):
     # Extraction is deterministic and cheap; regenerate unless hash was validated.
     if not (state and audio.exists() and state.get('audio_sha256') == sha256(audio)):
         progress('extracting audio')
-        extract(ffmpeg, source, audio, job)
+        extract(ffmpeg, source, audio, job, stream)
     plan, frames = plan_chunks(audio, job['chunk_seconds'])
     if state:
         if plan != state['plan'] or frames != state['frames']:
@@ -307,7 +326,7 @@ def process_file(item, job, ffmpeg, backend_factory, converter, progress):
         raise ValueError('Incomplete segment coverage')
     if all(s['kind'] in ('silence', 'non-speech') for s in state['segments']):
         raise ValueError('No speech recognized in recording; review audio before finalizing')
-    if fingerprint(source) != identity:
+    if fingerprint(source, stream_id) != identity:
         raise ValueError('Input changed during transcription; output was not published')
     text = render(state, job, converter)
     if not text.strip() or '\x00' in text:

@@ -13,6 +13,20 @@ from .bootstrap import MODELS, environment, ensure_environment, supported
 from .safety import Runtime, atomic_json, no_symlinks, sha256, validate_paths
 
 
+def transcription_options(s):
+    s.add_argument('--model', choices=['auto', *MODELS], default='auto')
+    s.add_argument('--language', choices=['auto', 'Cantonese'], default='Cantonese')
+    s.add_argument('--format', choices=['txt'], default='txt')
+    s.add_argument('--timestamps', action='store_true', help='Approximate chunk times')
+    s.add_argument('--glossary', help='UTF-8 domain context, at most 8000 characters')
+    s.add_argument('--overwrite', action='store_true')
+    s.add_argument('--resume', action='store_true')
+    s.add_argument('--dry-run', action='store_true')
+    s.add_argument('--keep-runtime', action='store_true')
+    s.add_argument('--yes', action='store_true')
+    s.add_argument('--chunk-seconds', type=int, default=28, choices=range(10, 30), metavar='10..29')
+
+
 def parser():
     p = argparse.ArgumentParser(description='Local Cantonese/English MP4 transcription; disposable runtime.')
     sub = p.add_subparsers(dest='command', required=True)
@@ -26,21 +40,21 @@ def parser():
         s = sub.add_parser(name)
         s.add_argument('--input', action='append', required=True, help='Repeat for multiple folders')
         s.add_argument('--output', required=True)
-        s.add_argument('--model', choices=['auto', *MODELS], default='auto')
-        s.add_argument('--language', choices=['auto', 'Cantonese'], default='Cantonese')
-        s.add_argument('--format', choices=['txt'], default='txt')
-        s.add_argument('--timestamps', action='store_true', help='Approximate chunk times')
-        s.add_argument('--glossary', help='UTF-8 domain context, at most 8000 characters')
-        s.add_argument('--overwrite', action='store_true')
-        s.add_argument('--resume', action='store_true')
         s.add_argument('--recursive', action='store_true')
-        s.add_argument('--dry-run', action='store_true')
-        s.add_argument('--keep-runtime', action='store_true')
-        s.add_argument('--yes', action='store_true')
-        s.add_argument('--chunk-seconds', type=int, default=28, choices=range(10, 30), metavar='10..29')
+        transcription_options(s)
         if name == 'preview':
             s.add_argument('--start', type=float, default=600)
             s.add_argument('--seconds', type=float, default=240)
+    h = sub.add_parser('hkust', help='Canvas link -> HKUST RVC recordings -> transcripts (audio streamed, no video saved)')
+    h.add_argument('link', help='canvas.ust.hk course, module, module item or page link (or an rvcmedia link)')
+    h.add_argument('--output', help='Transcript folder (required unless --list)')
+    h.add_argument('--select', action='append', help='Regex on recording title/path, e.g. 2026-09-14; repeatable')
+    h.add_argument('--latest', type=int, help='Only the newest N recordings')
+    h.add_argument('--list', action='store_true', help='Only list recordings found')
+    h.add_argument('--preview', action='store_true', help='Short sample of the first selected recording')
+    h.add_argument('--start', type=float, default=600)
+    h.add_argument('--seconds', type=float, default=240)
+    transcription_options(h)
     return p
 
 
@@ -115,6 +129,67 @@ def supervise(argv, env, fd, log):
         raise RuntimeError('Child exited with code %s. Runtime retained; rerun with --resume.' % code)
 
 
+def run_batch(args, repo, runtime, files, output, preview=False):
+    model = 'qwen3-asr-1.7b' if args.model == 'auto' else args.model
+    glossary = ''
+    if args.glossary:
+        glossary = no_symlinks(args.glossary).read_text(encoding='utf-8')
+        if len(glossary) > 8000:
+            raise ValueError('Glossary exceeds 8000 characters')
+    items = []
+    for file in files:
+        # A local Path, or dict(name=, source=, stream=, stream_id=) for a network stream.
+        item = dict(file) if isinstance(file, dict) else dict(source=str(file), name=file.stem)
+        dest = output / (item.pop('name') + ('.preview' if preview else '') + '.txt')
+        no_symlinks(dest)
+        if dest.exists() and not (args.overwrite or args.resume):
+            raise ValueError('Transcript exists; use --resume with retained state or --overwrite: ' + str(dest))
+        item['output'] = str(dest)
+        items.append(item)
+    print('%d recording(s); model=%s; language=%s; output=%s' % (len(items), model, args.language, output), flush=True)
+    print('First use downloads portable uv, managed Python, hash-locked packages/FFmpeg and pinned ASR weights over HTTPS.', flush=True)
+    print('Budget: ~4-5 GB downloads / up to 12 GB runtime disk. Audio/text never uploaded. Success purges runtime unless --keep-runtime.', flush=True)
+    if args.dry_run:
+        for item in items:
+            print(item.get('stream_id') or item['source'], '->', item['output'])
+        return 0
+    ask('Proceed with local processing and missing downloads?', args.yes)
+    if shutil.disk_usage(repo).free < 6 * 2**30:
+        raise ValueError('At least 6 GiB free disk required; 12 GiB recommended')
+    runtime.create()
+    with runtime.lock() as fd:
+        env = environment(runtime)
+        log = runtime.path / 'logs/run.log'
+        runner = lambda cmd, e: supervise(cmd, e, fd, log)
+        python = ensure_environment(runtime, env, runner)
+        if args.model == 'auto':
+            probe = subprocess.run([str(python), '-B', '-c',
+                'import mlx.core as mx; raise SystemExit(0 if mx.metal.is_available() else 1)'],
+                env=env, capture_output=True, text=True)
+            if probe.returncode:
+                model = 'whisper-large-v3'
+                print('Metal unavailable in this process: auto selected local Whisper large-v3 CPU int8. This may take hours.', flush=True)
+        job = dict(items=items, model=model, model_id=MODELS[model][0], revision=MODELS[model][1],
+            language=args.language, glossary=glossary, timestamps=args.timestamps,
+            chunk_seconds=args.chunk_seconds, resume=args.resume, overwrite=args.overwrite,
+            preview=preview, start=args.start if preview else 0,
+            seconds=args.seconds if preview else None, runtime=str(runtime.path))
+        job_path = runtime.path / 'job.json'
+        atomic_json(job_path, job)
+        runner([str(python), '-B', '-m', 'lecture_transcriber.worker', str(job_path)], env)
+        # At this point every worker has exited and no runtime executable is in use.
+        pending = [p for p in (runtime.path / 'checkpoints').glob('*.json')
+                   if p.name != 'status.json' and not json.loads(p.read_text()).get('complete')]
+        if pending:
+            print('Current batch complete. Retaining runtime because other unfinished checkpoints exist; use cleanup --purge to discard them.', flush=True)
+        elif not args.keep_runtime:
+            runtime.purge_locked(fd)
+            print('Success: all final transcripts validated; runtime removed.', flush=True)
+        else:
+            print('Success: runtime retained by --keep-runtime.', flush=True)
+    return 0
+
+
 def main(argv=None):
     args = parser().parse_args(argv)
     repo = Path(__file__).resolve().parents[2]
@@ -166,6 +241,9 @@ def main(argv=None):
                 runtime.purge_locked(fd)
             print('Runtime removed. Inputs and final transcripts preserved.')
             return 0
+        if args.command == 'hkust':
+            from .hkust_cli import run_hkust
+            return run_hkust(args, repo, runtime)
         if not supported():
             raise ValueError('This release requires Apple Silicon macOS. It does not install anything on other platforms.')
         inputs, output = validate_paths(repo, args.input, args.output)
@@ -174,61 +252,7 @@ def main(argv=None):
             if args.start < 0 or not 0 < args.seconds <= 300:
                 raise ValueError('Preview start must be >= 0 and duration must be 1..300 seconds')
             files = files[:1]
-        model = 'qwen3-asr-1.7b' if args.model == 'auto' else args.model
-        glossary = ''
-        if args.glossary:
-            glossary = no_symlinks(args.glossary).read_text(encoding='utf-8')
-            if len(glossary) > 8000:
-                raise ValueError('Glossary exceeds 8000 characters')
-        items = []
-        for file in files:
-            dest = output / (file.stem + ('.preview' if args.command == 'preview' else '') + '.txt')
-            no_symlinks(dest)
-            if dest.exists() and not (args.overwrite or args.resume):
-                raise ValueError('Transcript exists; use --resume with retained state or --overwrite: ' + str(dest))
-            items.append(dict(source=str(file), output=str(dest)))
-        print('%d recording(s); model=%s; language=%s; output=%s' % (len(items), model, args.language, output), flush=True)
-        print('First use downloads portable uv, managed Python, hash-locked packages/FFmpeg and pinned ASR weights over HTTPS.', flush=True)
-        print('Budget: ~4-5 GB downloads / up to 12 GB runtime disk. Audio/text never uploaded. Success purges runtime unless --keep-runtime.', flush=True)
-        if args.dry_run:
-            for item in items:
-                print(item['source'], '->', item['output'])
-            return 0
-        ask('Proceed with local processing and missing downloads?', args.yes)
-        if shutil.disk_usage(repo).free < 6 * 2**30:
-            raise ValueError('At least 6 GiB free disk required; 12 GiB recommended')
-        runtime.create()
-        with runtime.lock() as fd:
-            env = environment(runtime)
-            log = runtime.path / 'logs/run.log'
-            runner = lambda cmd, e: supervise(cmd, e, fd, log)
-            python = ensure_environment(runtime, env, runner)
-            if args.model == 'auto':
-                probe = subprocess.run([str(python), '-B', '-c',
-                    'import mlx.core as mx; raise SystemExit(0 if mx.metal.is_available() else 1)'],
-                    env=env, capture_output=True, text=True)
-                if probe.returncode:
-                    model = 'whisper-large-v3'
-                    print('Metal unavailable in this process: auto selected local Whisper large-v3 CPU int8. This may take hours.', flush=True)
-            job = dict(items=items, model=model, model_id=MODELS[model][0], revision=MODELS[model][1],
-                language=args.language, glossary=glossary, timestamps=args.timestamps,
-                chunk_seconds=args.chunk_seconds, resume=args.resume, overwrite=args.overwrite,
-                preview=args.command == 'preview', start=getattr(args, 'start', 0),
-                seconds=getattr(args, 'seconds', None), runtime=str(runtime.path))
-            job_path = runtime.path / 'job.json'
-            atomic_json(job_path, job)
-            runner([str(python), '-B', '-m', 'lecture_transcriber.worker', str(job_path)], env)
-            # At this point every worker has exited and no runtime executable is in use.
-            pending = [p for p in (runtime.path / 'checkpoints').glob('*.json')
-                       if p.name != 'status.json' and not json.loads(p.read_text()).get('complete')]
-            if pending:
-                print('Current batch complete. Retaining runtime because other unfinished checkpoints exist; use cleanup --purge to discard them.', flush=True)
-            elif not args.keep_runtime:
-                runtime.purge_locked(fd)
-                print('Success: all final transcripts validated; runtime removed.', flush=True)
-            else:
-                print('Success: runtime retained by --keep-runtime.', flush=True)
-        return 0
+        return run_batch(args, repo, runtime, files, output, preview=args.command == 'preview')
     except (ValueError, OSError, RuntimeError, subprocess.CalledProcessError) as error:
         print('ERROR:', error, file=sys.stderr, flush=True)
         return 1

@@ -33,6 +33,8 @@ for name in filter(None, paths):
         bad.append(name+': exceeds 1 MiB source limit')
     if re.search(rb'(?:sk-[A-Za-z0-9_-]{32,}|hf_[A-Za-z0-9]{25,}|-----BEGIN (?:RSA |OPENSSH )?PRIVATE KEY-----)',data):
         bad.append(name+': potential secret')
+    if re.search(rb'(?:/Users|/home)/(?!runner/|<)[A-Za-z0-9._-]+/', data):
+        bad.append(name+': hard-coded personal home path')
 if bad:
     print('\n'.join(bad),file=sys.stderr)
     sys.exit(1)
