@@ -25,6 +25,7 @@ def transcription_options(s):
     s.add_argument('--keep-runtime', action='store_true')
     s.add_argument('--yes', action='store_true')
     s.add_argument('--chunk-seconds', type=int, default=28, choices=range(10, 30), metavar='10..29')
+    s.add_argument('--json-progress', action='store_true', help='Also print @@progress JSON lines')
 
 
 def parser():
@@ -45,6 +46,14 @@ def parser():
         if name == 'preview':
             s.add_argument('--start', type=float, default=600)
             s.add_argument('--seconds', type=float, default=240)
+    i = sub.add_parser('install', help='Download runtime and model now; keep them for later runs')
+    i.add_argument('--model', choices=['auto', *MODELS], default='auto')
+    i.add_argument('--json-progress', action='store_true')
+    i.add_argument('--yes', action='store_true')
+    st = sub.add_parser('streams', help='Transcribe HTTPS audio/video streams listed in a JSON file')
+    st.add_argument('--streams', required=True, help='JSON list of {name, stream, stream_id}')
+    st.add_argument('--output', required=True)
+    transcription_options(st)
     h = sub.add_parser('hkust', help='Canvas link -> HKUST RVC recordings -> transcripts (audio streamed, no video saved)')
     h.add_argument('link', help='canvas.ust.hk course, module, module item or page link (or an rvcmedia link)')
     h.add_argument('--output', help='Transcript folder (required unless --list)')
@@ -129,6 +138,64 @@ def supervise(argv, env, fd, log):
         raise RuntimeError('Child exited with code %s. Runtime retained; rerun with --resume.' % code)
 
 
+def emit(args, event, **details):
+    if getattr(args, 'json_progress', False):
+        print('@@progress ' + json.dumps(dict(event=event, **details), ensure_ascii=False), flush=True)
+
+
+def choose_model(requested, python, env):
+    if requested != 'auto':
+        return requested
+    probe = subprocess.run([str(python), '-B', '-c',
+        'import mlx.core as mx; raise SystemExit(0 if mx.metal.is_available() else 1)'],
+        env=env, capture_output=True, text=True)
+    if probe.returncode:
+        print('Metal unavailable in this process: auto selected local Whisper large-v3 CPU int8. This may take hours.', flush=True)
+        return 'whisper-large-v3'
+    return 'qwen3-asr-1.7b'
+
+
+def install(args, repo, runtime):
+    """Prepare Python, packages, FFmpeg and model weights; keep them for later runs."""
+    print('Install downloads portable uv, managed Python, hash-locked packages/FFmpeg and pinned ASR weights over HTTPS.', flush=True)
+    print('Budget: ~4-5 GB downloads / up to 12 GB runtime disk. Remove with cleanup --purge.', flush=True)
+    ask('Download and install the local transcription runtime?', args.yes)
+    if shutil.disk_usage(repo).free < 6 * 2**30:
+        raise ValueError('At least 6 GiB free disk required; 12 GiB recommended')
+    runtime.create()
+    with runtime.lock() as fd:
+        env = environment(runtime)
+        runner = lambda cmd, e: supervise(cmd, e, fd, runtime.path / 'logs/run.log')
+        emit(args, 'preparing environment')
+        python = ensure_environment(runtime, env, runner)
+        model = choose_model(args.model, python, env)
+        job = dict(prefetch=True, json_progress=args.json_progress, model=model, model_id=MODELS[model][0],
+                   revision=MODELS[model][1], runtime=str(runtime.path))
+        job_path = runtime.path / 'job.json'
+        atomic_json(job_path, job)
+        runner([str(python), '-B', '-m', 'lecture_transcriber.worker', str(job_path)], env)
+    print('Installed: model=%s; runtime kept at %s' % (model, runtime.path), flush=True)
+    return 0
+
+
+def load_streams(path):
+    """--streams FILE: [{"name": ..., "stream": "https://...m3u8", "stream_id": ...}, ...]"""
+    data = json.loads(no_symlinks(path).read_text(encoding='utf-8'))
+    if not isinstance(data, list) or not data:
+        raise ValueError('Streams file must be a non-empty JSON list')
+    sources, names = [], set()
+    for entry in data:
+        name, stream, stream_id = (str(entry.get(k) or '') for k in ('name', 'stream', 'stream_id'))
+        if (not name or len(name) > 120 or name.startswith('.') or any(c in name for c in '/\\:\0')
+                or name.casefold() in names):
+            raise ValueError('Invalid or duplicate stream name: %r' % name)
+        if not stream.startswith('https://') or not stream_id:
+            raise ValueError('Each stream needs an https URL and a stable stream_id: %r' % name)
+        names.add(name.casefold())
+        sources.append(dict(name=name, source='stream:' + stream_id, stream=stream, stream_id=stream_id))
+    return sources
+
+
 def run_batch(args, repo, runtime, files, output, preview=False):
     model = 'qwen3-asr-1.7b' if args.model == 'auto' else args.model
     glossary = ''
@@ -161,15 +228,10 @@ def run_batch(args, repo, runtime, files, output, preview=False):
         env = environment(runtime)
         log = runtime.path / 'logs/run.log'
         runner = lambda cmd, e: supervise(cmd, e, fd, log)
+        emit(args, 'preparing environment')
         python = ensure_environment(runtime, env, runner)
-        if args.model == 'auto':
-            probe = subprocess.run([str(python), '-B', '-c',
-                'import mlx.core as mx; raise SystemExit(0 if mx.metal.is_available() else 1)'],
-                env=env, capture_output=True, text=True)
-            if probe.returncode:
-                model = 'whisper-large-v3'
-                print('Metal unavailable in this process: auto selected local Whisper large-v3 CPU int8. This may take hours.', flush=True)
-        job = dict(items=items, model=model, model_id=MODELS[model][0], revision=MODELS[model][1],
+        model = choose_model(args.model, python, env)
+        job = dict(items=items, json_progress=args.json_progress, model=model, model_id=MODELS[model][0], revision=MODELS[model][1],
             language=args.language, glossary=glossary, timestamps=args.timestamps,
             chunk_seconds=args.chunk_seconds, resume=args.resume, overwrite=args.overwrite,
             preview=preview, start=args.start if preview else 0,
@@ -241,6 +303,13 @@ def main(argv=None):
                 runtime.purge_locked(fd)
             print('Runtime removed. Inputs and final transcripts preserved.')
             return 0
+        if args.command in ('install', 'streams') and not supported():
+            raise ValueError('This release requires Apple Silicon macOS.')
+        if args.command == 'install':
+            return install(args, repo, runtime)
+        if args.command == 'streams':
+            _, output = validate_paths(repo, [], args.output)
+            return run_batch(args, repo, runtime, load_streams(args.streams), output)
         if args.command == 'hkust':
             from .hkust_cli import run_hkust
             return run_hkust(args, repo, runtime)

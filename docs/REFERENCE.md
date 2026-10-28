@@ -58,6 +58,19 @@ The program processes the audio in chunks of maximum 29 seconds. It cuts the chu
 
 The checks make sure that the program processed all of the audio. They do not make sure that each word is correct.
 
+## Use as a component
+
+Other programs can use the transcriber as a separate component. For example, HKUST Canvas Workbench uses it. These commands are for that use:
+
+```sh
+./run.sh install --model auto --json-progress --yes
+./run.sh streams --streams streams.json --output DIR --keep-runtime --json-progress --yes
+```
+
+* `install` downloads the runtime and the model. It does not read audio. It keeps the runtime after it completes.
+* `streams` transcribes HTTPS streams. The JSON file is a list of `{"name": ..., "stream": "https://...", "stream_id": ...}` items. `name` is the transcript file name. `stream_id` must not change between runs, so that `--resume` can find the saved work.
+* `--json-progress` adds lines that start with `@@progress `, followed by one JSON object. The `event` field gives the step, for example `preparing environment`, `downloading model`, `extracting audio`, `transcribing`, `complete` or `failed`.
+
 ## Runtime and privacy
 
 The program keeps all tools, models, caches, temporary audio, checkpoints and logs in `.runtime.nosync/`. The `.nosync` name stops iCloud from uploading this folder if the checkout is in iCloud Drive.

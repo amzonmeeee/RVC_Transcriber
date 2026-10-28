@@ -148,16 +148,55 @@ def timestamp(seconds):
     return '%02d:%02d:%02d' % (seconds // 3600, seconds % 3600 // 60, seconds % 60)
 
 
+WHISPER_SHA256 = '69f74147e3334731bc3a76048724833325d2ec74642fb52620eda87352e3d4f1'
+
+
+def fetch_qwen(job):
+    from huggingface_hub import snapshot_download
+    # Pin immutable revision and download only runtime model/tokenizer assets.
+    return snapshot_download(repo_id=job['model_id'], revision=job['revision'],
+        local_dir=str(Path(job['runtime']) / 'models' / job['model']),
+        allow_patterns=['*.json', '*.safetensors', 'merges.txt', 'vocab.json'], token=False)
+
+
+def fetch_whisper(job):
+    from huggingface_hub import snapshot_download
+    path = Path(job['runtime']) / 'models' / job['model']
+    ready = path / '.verified-model.json'
+    valid = False
+    if ready.exists():
+        manifest = json.loads(ready.read_text())
+        valid = manifest.get('revision') == job['revision'] and all(
+            (path / name).is_file() and sha256(path / name) == digest
+            for name, digest in manifest.get('files', {}).items()) and len(manifest.get('files', {})) == 5
+    if not valid:
+        snapshot_download(repo_id=job['model_id'], revision=job['revision'],
+            local_dir=str(path), allow_patterns=['*.json', 'model.bin'], token=False)
+    if sha256(path / 'model.bin') != WHISPER_SHA256:
+        raise ValueError('Whisper model checksum mismatch')
+    return path
+
+
+def prefetch(job):
+    """Download the model only; no audio is read and no model is loaded."""
+    emit(job, 'downloading model', model=job['model'])
+    (fetch_whisper if job['model'] == 'whisper-large-v3' else fetch_qwen)(job)
+    emit(job, 'installed', model=job['model'])
+    return 0
+
+
+def emit(job, event, **details):
+    """Machine-readable progress for programs that embed this transcriber."""
+    if job.get('json_progress'):
+        print('@@progress ' + json.dumps(dict(event=event, **details), ensure_ascii=False), flush=True)
+
+
 class QwenBackend:
     def __init__(self, job):
-        from huggingface_hub import snapshot_download
         import mlx.core as mx
         if not mx.metal.is_available():
             raise RuntimeError('Metal GPU is unavailable in this process; use a local macOS Terminal with GPU access.')
-        # Pin immutable revision and download only runtime model/tokenizer assets.
-        path = snapshot_download(repo_id=job['model_id'], revision=job['revision'],
-            local_dir=str(Path(job['runtime']) / 'models' / job['model']),
-            allow_patterns=['*.json', '*.safetensors', 'merges.txt', 'vocab.json'], token=False)
+        path = fetch_qwen(job)
         inference_offline()
         from mlx_qwen3_asr import Session
         self.session = Session(model=path)
@@ -179,21 +218,8 @@ class QwenBackend:
 
 class WhisperBackend:
     def __init__(self, job):
-        from huggingface_hub import snapshot_download
         from faster_whisper import WhisperModel
-        path = Path(job['runtime']) / 'models' / job['model']
-        ready = path / '.verified-model.json'
-        valid = False
-        if ready.exists():
-            manifest = json.loads(ready.read_text())
-            valid = manifest.get('revision') == job['revision'] and all(
-                (path / name).is_file() and sha256(path / name) == digest
-                for name, digest in manifest.get('files', {}).items()) and len(manifest.get('files', {})) == 5
-        if not valid:
-            snapshot_download(repo_id=job['model_id'], revision=job['revision'],
-                local_dir=str(path), allow_patterns=['*.json', 'model.bin'], token=False)
-        if sha256(path / 'model.bin') != '69f74147e3334731bc3a76048724833325d2ec74642fb52620eda87352e3d4f1':
-            raise ValueError('Whisper model checksum mismatch')
+        path = fetch_whisper(job)
         inference_offline()
         self.session = WhisperModel(str(path), device='cpu', compute_type='int8',
                                     cpu_threads=8, local_files_only=True)
@@ -369,6 +395,8 @@ def run(job, backend_factory=None, ffmpeg=None, converter=None):
                         model=job['model'], elapsed_seconds=round(time.monotonic() - started, 1),
                         outputs=outputs.copy(), failures=failures.copy(), **details)
             atomic_json(status, data)
+            emit(job, event, file=number, files=len(job['items']), output=item['output'],
+                 **{k: v for k, v in details.items() if k in ('segment', 'segments', 'audio_time', 'characters', 'error')})
             detail = ' %s/%s @ %s' % (details['segment'], details['segments'], details['audio_time']) if 'segment' in details else ''
             print('[%d/%d] %s%s (%.0fs)' % (number, len(job['items']), event, detail, data['elapsed_seconds']), flush=True)
         progress('starting')
@@ -380,7 +408,7 @@ def run(job, backend_factory=None, ffmpeg=None, converter=None):
             raise
         except Exception as exc:
             failures.append(dict(source=item['source'], error=str(exc)))
-            progress('failed')
+            progress('failed', error=str(exc))
             print('ERROR: ' + str(exc), file=sys.stderr, flush=True)
             # GPU initialization errors will affect every file; stop promptly.
             if not session:
@@ -396,6 +424,8 @@ def main():
     signal.signal(signal.SIGTERM, stop)
     job = json.loads(Path(sys.argv[1]).read_text())
     try:
+        if job.get('prefetch'):
+            return prefetch(job)
         return run(job)
     except KeyboardInterrupt:
         print('Interrupted. Finished segments are checkpointed.', flush=True)
